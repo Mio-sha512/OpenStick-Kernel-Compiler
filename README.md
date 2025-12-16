@@ -12,7 +12,7 @@ If you prefer not to compile yourself check the [releases page](https://github.c
 
 
 ## Requirements
-- Any distro  with bash, `git`, `curl`, and `python3` available.
+- Any distro  with `bash`, `git`, `curl`, and `python3` available.
 
 ## Instructions
 
@@ -28,17 +28,17 @@ cd OpenStick-Kernel-Compiler
 
 The script supports interactive and non-interactive modes and a small set of flags. Use these from the command line or via the interactive menu.
 
-- `--auto` — run non-interactively and use values from `.build_config` (see below). When `--auto` is used:
+- `--auto` - run non-interactively and use values from `.build_config` (see below). When `--auto` is used:
   - If `.build_config` exists, it will be sourced and those settings will be used without prompting.
   - If there is no `.build_config` and you did not pass any explicit flags (for example `--version` or `--cpr`), the script will exit and ask you to either create a saved config (by running once interactively and using `--save`) or supply explicit flags.
 
-- `--version <branch>` — select the kernel branch to build (e.g. `msm8916/6.12.1`). This overrides the saved `KERNEL_VERSION` when used alongside `--auto`.
+- `--version <branch>` - select the kernel branch to build (e.g. `msm8916/6.12.1`). This overrides the saved `KERNEL_VERSION` when used alongside `--auto`.
 
-- `--cpr` / `--no-cpr` — enable or disable the CPR patch (see note below). Passing these on the command line overrides the saved `ENABLE_CPR` value.
+- `--cpr` / `--no-cpr` - enable or disable the CPR patch (see note below). Passing these on the command line overrides the saved `ENABLE_CPR` value.
 
-- `--clean` — force a clean build (removes output cache).
+- `--clean` - force a clean build (removes output cache).
 
-- `--save` — after you finish the interactive prompts, write the selected settings to `.build_config` so they are reused by `--auto` in future runs.
+- `--save` - after you finish the interactive prompts, write the selected settings to `.build_config` so they are reused by `--auto` in future runs.
 
 Example: non-interactive CPR build using a known-good branch
 
