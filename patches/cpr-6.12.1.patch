@@ -1,0 +1,1261 @@
+From e498d1ae685152ef57a7a9df82f3cfd1ae2628ac Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan.gerhold@kernkonzept.com>
+Date: Tue, 12 Sep 2023 11:40:15 +0200
+Subject: [PATCH 01/14] cpufreq: qcom-nvmem: Enable virtual power domain
+ devices
+
+The genpd core ignores performance state votes from devices that are
+runtime suspended as of commit 5937c3ce2122 ("PM: domains: Drop/restore
+performance state votes for devices at runtime PM"). However, at the
+moment nothing ever enables the virtual devices created in
+qcom-cpufreq-nvmem for the cpufreq power domain scaling, so they are
+permanently runtime-suspended.
+
+Fix this by enabling the devices after attaching them and use
+dev_pm_syscore_device() to ensure the power domain also stays on when
+going to suspend. Since it supplies the CPU we can never turn it off
+from Linux. There are other mechanisms to turn it off when needed,
+usually in the RPM firmware or the cpuidle path.
+
+Without this fix performance states votes are silently ignored, and the
+CPU/CPR voltage is never adjusted. This has been broken since 5.14 but
+for some reason no one noticed this on QCS404 so far.
+
+Cc: stable@vger.kernel.org
+Fixes: 1cb8339ca225 ("cpufreq: qcom: Add support for qcs404 on nvmem driver")
+Signed-off-by: Stephan Gerhold <stephan.gerhold@kernkonzept.com>
+Link: https://lore.kernel.org/r/20230912-msm8909-cpufreq-v1-1-767ce66b544b@kernkonzept.com
+---
+ drivers/cpufreq/qcom-cpufreq-nvmem.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/cpufreq/qcom-cpufreq-nvmem.c b/drivers/cpufreq/qcom-cpufreq-nvmem.c
+index 703308fb891a..7df85d5cff16 100644
+--- a/drivers/cpufreq/qcom-cpufreq-nvmem.c
++++ b/drivers/cpufreq/qcom-cpufreq-nvmem.c
+@@ -553,6 +553,9 @@ static int qcom_cpufreq_probe(struct platform_device *pdev)
+ 
+ 					goto free_opp;
+ 				}
++
++				/* Keep CPU power domain always-on */
++				dev_pm_syscore_device(virt_devs[i], true);
+ 			}
+ 			drv->cpus[cpu].virt_devs = virt_devs;
+ 		}
+-- 
+2.52.0
+
+
+From 3f0c71c9c50898768c61e4aad192c2a460253a36 Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan.gerhold@kernkonzept.com>
+Date: Tue, 12 Sep 2023 11:40:18 +0200
+Subject: [PATCH 02/14] cpufreq: qcom-nvmem: Add MSM8909
+
+When the MSM8909 SoC is used together with the PM8909 PMIC the primary
+power supply for the CPU (VDD_APC) is shared with other components to
+the SoC, namely the VDD_CX power domain typically supplied by the PM8909
+S1 regulator. This means that all votes for necessary performance states
+go via the RPM firmware which collects the requirements from all the
+processors in the SoC. The RPM firmware then chooses the actual voltage
+based on the performance states ("corners"), depending on calibration
+values in the NVMEM and other factors.
+
+The MSM8909 SoC is also sometimes used with the PM8916 or PM660 PMIC.
+In that case there is a dedicated regulator connected to VDD_APC and
+Linux is responsible to do adaptive voltage scaling using CPR (similar
+to the existing code for QCS404).
+
+This difference can be described in the device tree, by either assigning
+the CPU a power domain from RPMPD or from the CPR driver.
+
+To describe this in a more generic way, use "apc" as power domain name
+instead of "cpr". From the Linux point of view there is no CPR involved
+when MSM8909 is used together with PM8909.
+
+Also add a simple function that reads the speedbin from a NVMEM cell
+and sets it as-is for opp-supported-hw. The actual bit position can be
+described in the device tree without additional driver changes.
+
+Signed-off-by: Stephan Gerhold <stephan.gerhold@kernkonzept.com>
+Acked-by: Konrad Dybcio <konrad.dybcio@linaro.org>
+Link: https://lore.kernel.org/r/20230912-msm8909-cpufreq-v1-4-767ce66b544b@kernkonzept.com
+---
+ drivers/cpufreq/qcom-cpufreq-nvmem.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/cpufreq/qcom-cpufreq-nvmem.c b/drivers/cpufreq/qcom-cpufreq-nvmem.c
+index 7df85d5cff16..584c274bb358 100644
+--- a/drivers/cpufreq/qcom-cpufreq-nvmem.c
++++ b/drivers/cpufreq/qcom-cpufreq-nvmem.c
+@@ -405,9 +405,11 @@ static const struct qcom_cpufreq_match_data match_data_krait = {
+ 	.get_version = qcom_cpufreq_krait_name_version,
+ };
+ 
++static const char *msm8909_genpd_names[] = { "apc", NULL };
++
+ static const struct qcom_cpufreq_match_data match_data_msm8909 = {
+ 	.get_version = qcom_cpufreq_simple_get_version,
+-	.genpd_names = generic_genpd_names,
++	.genpd_names = msm8909_genpd_names,
+ };
+ 
+ static const char *qcs404_genpd_names[] = { "cpr", NULL };
+-- 
+2.52.0
+
+
+From 053f815b7ea01eefca4ea4bc96622db133c0c688 Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Sat, 12 Aug 2023 17:09:18 +0200
+Subject: [PATCH 03/14] soc: qcom: cpr: Search all required-opps for CPR
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/pmdomain/qcom/cpr.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr.c b/drivers/pmdomain/qcom/cpr.c
+index e1fca65b80be..f5edf82c89be 100644
+--- a/drivers/pmdomain/qcom/cpr.c
++++ b/drivers/pmdomain/qcom/cpr.c
+@@ -1048,14 +1048,17 @@ static unsigned long cpr_get_opp_hz_for_req(struct dev_pm_opp *ref,
+ 		return 0;
+ 
+ 	for_each_available_child_of_node_scoped(desc_np, child_np) {
+-		struct device_node *child_req_np __free(device_node) =
+-			of_parse_phandle(child_np, "required-opps", 0);
++		struct of_phandle_iterator it;
++		int err;
+ 
+-		if (child_req_np == ref_np) {
+-			u64 rate = 0;
++		of_for_each_phandle(&it, err, child_np, "required-opps", NULL, 0) {
++			if (it.node == ref_np) {
++				u64 rate = 0;
+ 
+-			of_property_read_u64(child_np, "opp-hz", &rate);
+-			return (unsigned long) rate;
++				of_property_read_u64(child_np, "opp-hz", &rate);
++				of_node_put(it.node);
++				return (unsigned long) rate;
++			}
+ 		}
+ 	}
+ 
+-- 
+2.52.0
+
+
+From 9ab1970a54701a905bf66d2f93a6ab1d5dca3f3a Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Thu, 3 Aug 2023 11:05:06 +0200
+Subject: [PATCH 04/14] soc: qcom: cpr: Constify
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/pmdomain/qcom/cpr.c | 34 ++++++++++++++++------------------
+ 1 file changed, 16 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr.c b/drivers/pmdomain/qcom/cpr.c
+index f5edf82c89be..4ce0c6b56b00 100644
+--- a/drivers/pmdomain/qcom/cpr.c
++++ b/drivers/pmdomain/qcom/cpr.c
+@@ -131,10 +131,10 @@ enum voltage_change_dir {
+ };
+ 
+ struct cpr_fuse {
+-	char *ring_osc;
+-	char *init_voltage;
+-	char *quotient;
+-	char *quotient_offset;
++	const char *ring_osc;
++	const char *init_voltage;
++	const char *quotient;
++	const char *quotient_offset;
+ };
+ 
+ struct fuse_corner_data {
+@@ -155,7 +155,7 @@ struct fuse_corner_data {
+ struct cpr_fuses {
+ 	int init_voltage_step;
+ 	int init_voltage_width;
+-	struct fuse_corner_data *fuse_corner_data;
++	const struct fuse_corner_data *fuse_corner_data;
+ };
+ 
+ struct corner_data {
+@@ -166,7 +166,7 @@ struct corner_data {
+ struct cpr_desc {
+ 	unsigned int num_fuse_corners;
+ 	int min_diff_quot;
+-	int *step_quot;
++	const int *step_quot;
+ 
+ 	unsigned int		timer_delay_us;
+ 	unsigned int		timer_cons_up;
+@@ -188,9 +188,9 @@ struct acc_desc {
+ 	unsigned int	enable_reg;
+ 	u32		enable_mask;
+ 
+-	struct reg_sequence	*config;
+-	struct reg_sequence	*settings;
+-	int			num_regs_per_fuse;
++	const struct reg_sequence	*config;
++	const struct reg_sequence	*settings;
++	int				num_regs_per_fuse;
+ };
+ 
+ struct cpr_acc_desc {
+@@ -847,7 +847,7 @@ static int cpr_fuse_corner_init(struct cpr_drv *drv)
+ 	const struct acc_desc *acc_desc = drv->acc_desc;
+ 	int i;
+ 	unsigned int step_volt;
+-	struct fuse_corner_data *fdata;
++	const struct fuse_corner_data *fdata;
+ 	struct fuse_corner *fuse, *end;
+ 	int uV;
+ 	const struct reg_sequence *accs;
+@@ -870,8 +870,8 @@ static int cpr_fuse_corner_init(struct cpr_drv *drv)
+ 		 * regulators than the one used to characterize the algorithms
+ 		 * (ie, init_voltage_step).
+ 		 */
+-		fdata->min_uV = roundup(fdata->min_uV, step_volt);
+-		fdata->max_uV = roundup(fdata->max_uV, step_volt);
++		fuse->min_uV = roundup(fdata->min_uV, step_volt);
++		fuse->max_uV = roundup(fdata->max_uV, step_volt);
+ 
+ 		/* Populate uV */
+ 		uV = cpr_read_fuse_uV(desc, fdata, fuses->init_voltage,
+@@ -879,8 +879,6 @@ static int cpr_fuse_corner_init(struct cpr_drv *drv)
+ 		if (uV < 0)
+ 			return uV;
+ 
+-		fuse->min_uV = fdata->min_uV;
+-		fuse->max_uV = fdata->max_uV;
+ 		fuse->uV = clamp(uV, fuse->min_uV, fuse->max_uV);
+ 
+ 		if (fuse == end) {
+@@ -1339,7 +1337,7 @@ static int cpr_find_initial_corner(struct cpr_drv *drv)
+ static const struct cpr_desc qcs404_cpr_desc = {
+ 	.num_fuse_corners = 3,
+ 	.min_diff_quot = CPR_FUSE_MIN_QUOT_DIFF,
+-	.step_quot = (int []){ 25, 25, 25, },
++	.step_quot = (const int []){ 25, 25, 25, },
+ 	.timer_delay_us = 5000,
+ 	.timer_cons_up = 0,
+ 	.timer_cons_down = 2,
+@@ -1352,7 +1350,7 @@ static const struct cpr_desc qcs404_cpr_desc = {
+ 	.cpr_fuses = {
+ 		.init_voltage_step = 8000,
+ 		.init_voltage_width = 6,
+-		.fuse_corner_data = (struct fuse_corner_data[]){
++		.fuse_corner_data = (const struct fuse_corner_data[]){
+ 			/* fuse corner 0 */
+ 			{
+ 				.ref_uV = 1224000,
+@@ -1397,7 +1395,7 @@ static const struct cpr_desc qcs404_cpr_desc = {
+ };
+ 
+ static const struct acc_desc qcs404_acc_desc = {
+-	.settings = (struct reg_sequence[]){
++	.settings = (const struct reg_sequence[]){
+ 		{ 0xb120, 0x1041040 },
+ 		{ 0xb124, 0x41 },
+ 		{ 0xb120, 0x0 },
+@@ -1405,7 +1403,7 @@ static const struct acc_desc qcs404_acc_desc = {
+ 		{ 0xb120, 0x0 },
+ 		{ 0xb124, 0x0 },
+ 	},
+-	.config = (struct reg_sequence[]){
++	.config = (const struct reg_sequence[]){
+ 		{ 0xb138, 0xff },
+ 		{ 0xb130, 0x5555 },
+ 	},
+-- 
+2.52.0
+
+
+From 1959428aef422af627ca3469748d6ac52f074c25 Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Thu, 3 Aug 2023 10:36:19 +0200
+Subject: [PATCH 05/14] soc: qcom: cpr: Drop cpr_fuse_revision
+
+This is not used anywhere and some SoCs like MSM8916 do not seem to
+have such a fuse (or at least it's not listed in Qualcomm's
+downstream/vendor device tree).
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/pmdomain/qcom/cpr.c | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr.c b/drivers/pmdomain/qcom/cpr.c
+index 4ce0c6b56b00..c8f000eeb913 100644
+--- a/drivers/pmdomain/qcom/cpr.c
++++ b/drivers/pmdomain/qcom/cpr.c
+@@ -1595,7 +1595,6 @@ static int cpr_probe(struct platform_device *pdev)
+ 	int irq, ret;
+ 	const struct cpr_acc_desc *data;
+ 	struct device_node *np;
+-	u32 cpr_rev = FUSE_REVISION_UNKNOWN;
+ 
+ 	data = of_device_get_match_data(dev);
+ 	if (!data || !data->cpr_desc || !data->acc_desc)
+@@ -1642,10 +1641,6 @@ static int cpr_probe(struct platform_device *pdev)
+ 	 * initialized after attaching to the power domain,
+ 	 * since it depends on the CPU's OPP table.
+ 	 */
+-	ret = nvmem_cell_read_variable_le_u32(dev, "cpr_fuse_revision", &cpr_rev);
+-	if (ret)
+-		return ret;
+-
+ 	drv->cpr_fuses = cpr_get_fuses(drv);
+ 	if (IS_ERR(drv->cpr_fuses))
+ 		return PTR_ERR(drv->cpr_fuses);
+-- 
+2.52.0
+
+
+From 94f212a65685bdfd662b4b3d87a82c04d1a24b31 Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Fri, 3 Jul 2020 11:14:50 +0200
+Subject: [PATCH 06/14] soc: qcom: cpr: Add support for MEM ACC override
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/pmdomain/qcom/cpr.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/pmdomain/qcom/cpr.c b/drivers/pmdomain/qcom/cpr.c
+index c8f000eeb913..ad8cd965927e 100644
+--- a/drivers/pmdomain/qcom/cpr.c
++++ b/drivers/pmdomain/qcom/cpr.c
+@@ -190,6 +190,7 @@ struct acc_desc {
+ 
+ 	const struct reg_sequence	*config;
+ 	const struct reg_sequence	*settings;
++	const struct reg_sequence	*override_settings;
+ 	int				num_regs_per_fuse;
+ };
+ 
+@@ -852,8 +853,18 @@ static int cpr_fuse_corner_init(struct cpr_drv *drv)
+ 	int uV;
+ 	const struct reg_sequence *accs;
+ 	int ret;
++	u32 val;
+ 
+ 	accs = acc_desc->settings;
++	if (acc_desc->override_settings) {
++		ret = nvmem_cell_read_variable_le_u32(drv->dev, "mem_acc_override", &val);
++		if (ret)
++			return ret;
++
++		dev_dbg(drv->dev, "mem acc override fuse value: %#x\n", val);
++		if (val)
++			accs = acc_desc->override_settings;
++	}
+ 
+ 	step_volt = regulator_get_linear_step(drv->vdd_apc);
+ 	if (!step_volt)
+-- 
+2.52.0
+
+
+From 72c6ba7fb7932cb4a865cff6af1cedb7c68533c5 Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Fri, 11 Aug 2023 20:16:51 +0200
+Subject: [PATCH 07/14] soc: qcom: cpr: Split fuse voltage parsing into
+ separate function
+
+No functional change.
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/pmdomain/qcom/cpr.c | 61 ++++++++++++++++++++++---------------
+ 1 file changed, 36 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr.c b/drivers/pmdomain/qcom/cpr.c
+index ad8cd965927e..6b9d67e9d46b 100644
+--- a/drivers/pmdomain/qcom/cpr.c
++++ b/drivers/pmdomain/qcom/cpr.c
+@@ -841,41 +841,22 @@ static int cpr_read_fuse_uV(const struct cpr_desc *desc,
+ 	return DIV_ROUND_UP(uV, step_volt) * step_volt;
+ }
+ 
+-static int cpr_fuse_corner_init(struct cpr_drv *drv)
++static int cpr_fuse_corner_read_voltages(struct cpr_drv *drv)
+ {
+ 	const struct cpr_desc *desc = drv->desc;
+ 	const struct cpr_fuse *fuses = drv->cpr_fuses;
+-	const struct acc_desc *acc_desc = drv->acc_desc;
+-	int i;
++	struct fuse_corner *fuse = drv->fuse_corners;
++	struct fuse_corner *end = &fuse[desc->num_fuse_corners - 1];
++	const struct fuse_corner_data *fdata = desc->cpr_fuses.fuse_corner_data;
+ 	unsigned int step_volt;
+-	const struct fuse_corner_data *fdata;
+-	struct fuse_corner *fuse, *end;
+ 	int uV;
+-	const struct reg_sequence *accs;
+ 	int ret;
+-	u32 val;
+-
+-	accs = acc_desc->settings;
+-	if (acc_desc->override_settings) {
+-		ret = nvmem_cell_read_variable_le_u32(drv->dev, "mem_acc_override", &val);
+-		if (ret)
+-			return ret;
+-
+-		dev_dbg(drv->dev, "mem acc override fuse value: %#x\n", val);
+-		if (val)
+-			accs = acc_desc->override_settings;
+-	}
+ 
+ 	step_volt = regulator_get_linear_step(drv->vdd_apc);
+ 	if (!step_volt)
+ 		return -EINVAL;
+ 
+-	/* Populate fuse_corner members */
+-	fuse = drv->fuse_corners;
+-	end = &fuse[desc->num_fuse_corners - 1];
+-	fdata = desc->cpr_fuses.fuse_corner_data;
+-
+-	for (i = 0; fuse <= end; fuse++, fuses++, i++, fdata++) {
++	for (; fuse <= end; fuse++, fuses++, fdata++) {
+ 		/*
+ 		 * Update SoC voltages: platforms might choose a different
+ 		 * regulators than the one used to characterize the algorithms
+@@ -911,8 +892,38 @@ static int cpr_fuse_corner_init(struct cpr_drv *drv)
+ 		fuse->quot += fdata->quot_offset;
+ 		fuse->quot += fdata->quot_adjust;
+ 		fuse->step_quot = desc->step_quot[fuse->ring_osc_idx];
++	}
++
++	return 0;
++}
++
++static int cpr_fuse_corner_init(struct cpr_drv *drv)
++{
++	const struct acc_desc *acc_desc = drv->acc_desc;
++	struct fuse_corner *fuse = drv->fuse_corners;
++	struct fuse_corner *end = &fuse[drv->desc->num_fuse_corners - 1];
++	int i;
++	const struct reg_sequence *accs;
++	int ret;
++	u32 val;
++
++	accs = acc_desc->settings;
++	if (acc_desc->override_settings) {
++		ret = nvmem_cell_read_variable_le_u32(drv->dev, "mem_acc_override", &val);
++		if (ret)
++			return ret;
++
++		dev_dbg(drv->dev, "mem acc override fuse value: %#x\n", val);
++		if (val)
++			accs = acc_desc->override_settings;
++	}
++
++	ret = cpr_fuse_corner_read_voltages(drv);
++	if (ret)
++		return ret;
+ 
+-		/* Populate acc settings */
++	/* Populate acc settings */
++	for (fuse = drv->fuse_corners; fuse <= end; fuse++) {
+ 		fuse->accs = accs;
+ 		fuse->num_accs = acc_desc->num_regs_per_fuse;
+ 		accs += acc_desc->num_regs_per_fuse;
+-- 
+2.52.0
+
+
+From b77de0d690d59a64a54828bee17947cb18fda2d6 Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Fri, 11 Aug 2023 20:20:15 +0200
+Subject: [PATCH 08/14] soc: qcom: cpr: Initialize loop_disabled
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/pmdomain/qcom/cpr.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/pmdomain/qcom/cpr.c b/drivers/pmdomain/qcom/cpr.c
+index 6b9d67e9d46b..0911ca6372f2 100644
+--- a/drivers/pmdomain/qcom/cpr.c
++++ b/drivers/pmdomain/qcom/cpr.c
+@@ -1628,6 +1628,7 @@ static int cpr_probe(struct platform_device *pdev)
+ 	drv->dev = dev;
+ 	drv->desc = data->cpr_desc;
+ 	drv->acc_desc = data->acc_desc;
++	drv->loop_disabled = true;
+ 
+ 	drv->fuse_corners = devm_kcalloc(dev, drv->desc->num_fuse_corners,
+ 					 sizeof(*drv->fuse_corners),
+-- 
+2.52.0
+
+
+From 2d69c13338f8f95de986a62c99f368313bf81c9e Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Fri, 11 Aug 2023 20:26:26 +0200
+Subject: [PATCH 09/14] soc: qcom: cpr: Allow forcing ceiling voltages without
+ reading fuses
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/pmdomain/qcom/cpr.c | 44 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr.c b/drivers/pmdomain/qcom/cpr.c
+index 0911ca6372f2..4fc5d5feea3e 100644
+--- a/drivers/pmdomain/qcom/cpr.c
++++ b/drivers/pmdomain/qcom/cpr.c
+@@ -689,6 +689,10 @@ static int cpr_config(struct cpr_drv *drv)
+ 	cpr_write(drv, REG_RBIF_IRQ_EN(0), 0);
+ 	cpr_write(drv, REG_RBCPR_CTL, 0);
+ 
++	/* Without fuses we never allow enabling, so skip initialization */
++	if (!drv->cpr_fuses)
++		return 0;
++
+ 	/* Program the default HW ceiling, floor and vlevel */
+ 	val = (RBIF_LIMIT_CEILING_DEFAULT & RBIF_LIMIT_CEILING_MASK)
+ 		<< RBIF_LIMIT_CEILING_SHIFT;
+@@ -806,6 +810,9 @@ cpr_populate_ring_osc_idx(struct cpr_drv *drv)
+ 	u32 data;
+ 	int ret;
+ 
++	if (!fuses)
++		return 0;
++
+ 	for (; fuse < end; fuse++, fuses++) {
+ 		ret = nvmem_cell_read_variable_le_u32(drv->dev, fuses->ring_osc, &data);
+ 		if (ret)
+@@ -897,6 +904,21 @@ static int cpr_fuse_corner_read_voltages(struct cpr_drv *drv)
+ 	return 0;
+ }
+ 
++static int cpr_fuse_corner_set_ceil_voltages(struct cpr_drv *drv)
++{
++	const struct fuse_corner_data *fdata = drv->desc->cpr_fuses.fuse_corner_data;
++	struct fuse_corner *fuse = drv->fuse_corners;
++	struct fuse_corner *end = &fuse[drv->desc->num_fuse_corners - 1];
++
++	for (; fuse <= end; fuse++, fdata++) {
++		fuse->min_uV = fdata->min_uV;
++		fuse->max_uV = fdata->max_uV;
++		fuse->uV = fuse->max_uV;
++	}
++
++	return 0;
++}
++
+ static int cpr_fuse_corner_init(struct cpr_drv *drv)
+ {
+ 	const struct acc_desc *acc_desc = drv->acc_desc;
+@@ -918,7 +940,10 @@ static int cpr_fuse_corner_init(struct cpr_drv *drv)
+ 			accs = acc_desc->override_settings;
+ 	}
+ 
+-	ret = cpr_fuse_corner_read_voltages(drv);
++	if (drv->cpr_fuses)
++		ret = cpr_fuse_corner_read_voltages(drv);
++	else
++		ret = cpr_fuse_corner_set_ceil_voltages(drv);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1102,7 +1127,7 @@ static int cpr_corner_init(struct cpr_drv *drv)
+ 	int step_volt = regulator_get_linear_step(drv->vdd_apc);
+ 	struct dev_pm_opp *opp;
+ 
+-	if (!step_volt)
++	if (fuses && !step_volt)
+ 		return -EINVAL;
+ 
+ 	corner = drv->corners;
+@@ -1186,7 +1211,6 @@ static int cpr_corner_init(struct cpr_drv *drv)
+ 	for (apply_scaling = false, i = 0; corner <= end; corner++, i++) {
+ 		fnum = cdata[i].fuse_corner;
+ 		fdata = &desc->cpr_fuses.fuse_corner_data[fnum];
+-		quot_offset = fuses[fnum].quotient_offset;
+ 		fuse = &drv->fuse_corners[fnum];
+ 		if (fnum)
+ 			prev_fuse = &drv->fuse_corners[fnum - 1];
+@@ -1197,7 +1221,10 @@ static int cpr_corner_init(struct cpr_drv *drv)
+ 		corner->freq = cdata[i].freq;
+ 		corner->uV = fuse->uV;
+ 
+-		if (prev_fuse && cdata[i - 1].freq == prev_fuse->max_freq) {
++		if (!fuses) {
++			/* No fuse adjustments, always apply ceiling voltages */
++		} else if (prev_fuse && cdata[i - 1].freq == prev_fuse->max_freq) {
++			quot_offset = fuses[fnum].quotient_offset;
+ 			scaling = cpr_calculate_scaling(quot_offset, drv,
+ 							fdata, corner);
+ 			if (scaling < 0)
+@@ -1242,6 +1269,12 @@ static const struct cpr_fuse *cpr_get_fuses(struct cpr_drv *drv)
+ 	struct cpr_fuse *fuses;
+ 	int i;
+ 
++	/* Skip reading fuses if ceiling voltage is forced */
++	if (device_property_read_bool(drv->dev, "qcom,force-ceiling-voltage")) {
++		dev_info(drv->dev, "using static ceiling voltages instead of AVS\n");
++		return NULL;
++	}
++
+ 	fuses = devm_kcalloc(drv->dev, desc->num_fuse_corners,
+ 			     sizeof(struct cpr_fuse),
+ 			     GFP_KERNEL);
+@@ -1521,7 +1554,8 @@ static int cpr_pd_attach_dev(struct generic_pm_domain *domain,
+ 	if (ret)
+ 		return ret;
+ 
+-	cpr_set_loop_allowed(drv);
++	if (drv->cpr_fuses)
++		cpr_set_loop_allowed(drv);
+ 
+ 	ret = cpr_init_parameters(drv);
+ 	if (ret)
+-- 
+2.52.0
+
+
+From 2dcee4a019e7ae88ac648ee22174b499f1bb1afd Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Fri, 11 Aug 2023 20:28:51 +0200
+Subject: [PATCH 10/14] soc: qcom: cpr: Add partial support for MSM8916
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/pmdomain/qcom/cpr.c | 50 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/drivers/pmdomain/qcom/cpr.c b/drivers/pmdomain/qcom/cpr.c
+index 4fc5d5feea3e..092afece6684 100644
+--- a/drivers/pmdomain/qcom/cpr.c
++++ b/drivers/pmdomain/qcom/cpr.c
+@@ -1275,6 +1275,12 @@ static const struct cpr_fuse *cpr_get_fuses(struct cpr_drv *drv)
+ 		return NULL;
+ 	}
+ 
++	/* Fail if CPR description is incomplete and only allows DVFS */
++	if (!desc->step_quot) {
++		dev_err(drv->dev, "fuse-based scaling not supported yet\n");
++		return ERR_PTR(-EINVAL);
++	}
++
+ 	fuses = devm_kcalloc(drv->dev, desc->num_fuse_corners,
+ 			     sizeof(struct cpr_fuse),
+ 			     GFP_KERNEL);
+@@ -1389,6 +1395,49 @@ static int cpr_find_initial_corner(struct cpr_drv *drv)
+ 	return 0;
+ }
+ 
++static const struct cpr_desc msm8916_cpr_desc = {
++	/* NOTE: This is incomplete, fuse adjustments are not supported yet */
++	.num_fuse_corners = 3,
++	.cpr_fuses = {
++		.fuse_corner_data = (struct fuse_corner_data[]){
++			/* fuse corner 0 */
++			{
++				.max_uV = 1050000,
++				.min_uV = 1050000,
++			},
++			/* fuse corner 1 */
++			{
++				.max_uV = 1150000,
++				.min_uV = 1050000,
++			},
++			/* fuse corner 2 */
++			{
++				.max_uV = 1350000,
++				.min_uV = 1162500,
++			},
++		},
++	},
++};
++
++static const struct acc_desc msm8916_acc_desc = {
++	.settings = (const struct reg_sequence[]){
++		{ 0xf000, 0x0 },
++		{ 0xf000, 0x100 },
++		{ 0xf000, 0x101 },
++	},
++	.override_settings = (const struct reg_sequence[]){
++		{ 0xf000, 0x0 },
++		{ 0xf000, 0x100 },
++		{ 0xf000, 0x100 },
++	},
++	.num_regs_per_fuse = 1,
++};
++
++static const struct cpr_acc_desc msm8916_cpr_acc_desc = {
++	.cpr_desc = &msm8916_cpr_desc,
++	.acc_desc = &msm8916_acc_desc,
++};
++
+ static const struct cpr_desc qcs404_cpr_desc = {
+ 	.num_fuse_corners = 3,
+ 	.min_diff_quot = CPR_FUSE_MIN_QUOT_DIFF,
+@@ -1763,6 +1812,7 @@ static void cpr_remove(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id cpr_match_table[] = {
++	{ .compatible = "qcom,msm8916-cpr", .data = &msm8916_cpr_acc_desc },
+ 	{ .compatible = "qcom,qcs404-cpr", .data = &qcs404_cpr_acc_desc },
+ 	{ }
+ };
+-- 
+2.52.0
+
+
+From 3505dba3af9dad269b7d837679c390a163b9e5b1 Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Fri, 11 Aug 2023 21:03:28 +0200
+Subject: [PATCH 11/14] cpufreq: qcom-nvmem: Move nvmem cell reading into
+ get_version()
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/cpufreq/qcom-cpufreq-nvmem.c | 54 +++++++++++++++-------------
+ 1 file changed, 29 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/cpufreq/qcom-cpufreq-nvmem.c b/drivers/cpufreq/qcom-cpufreq-nvmem.c
+index 584c274bb358..efc698ddce24 100644
+--- a/drivers/cpufreq/qcom-cpufreq-nvmem.c
++++ b/drivers/cpufreq/qcom-cpufreq-nvmem.c
+@@ -49,7 +49,7 @@ struct qcom_cpufreq_drv;
+ 
+ struct qcom_cpufreq_match_data {
+ 	int (*get_version)(struct device *cpu_dev,
+-			   struct nvmem_cell *speedbin_nvmem,
++			   struct device_node *np,
+ 			   char **pvs_name,
+ 			   struct qcom_cpufreq_drv *drv);
+ 	const char **genpd_names;
+@@ -68,15 +68,30 @@ struct qcom_cpufreq_drv {
+ 
+ static struct platform_device *cpufreq_dt_pdev, *cpufreq_pdev;
+ 
++static void *qcom_cpufreq_read_nvmem_cell(struct device_node *np, const char *id,
++					  size_t *len)
++{
++	struct nvmem_cell *cell;
++	void *val;
++
++	cell = of_nvmem_cell_get(np, id);
++	if (IS_ERR(cell))
++		return cell;
++
++	val = nvmem_cell_read(cell, len);
++	nvmem_cell_put(cell);
++	return val;
++}
++
+ static int qcom_cpufreq_simple_get_version(struct device *cpu_dev,
+-					   struct nvmem_cell *speedbin_nvmem,
++					   struct device_node *np,
+ 					   char **pvs_name,
+ 					   struct qcom_cpufreq_drv *drv)
+ {
+ 	u8 *speedbin;
+ 
+ 	*pvs_name = NULL;
+-	speedbin = nvmem_cell_read(speedbin_nvmem, NULL);
++	speedbin = qcom_cpufreq_read_nvmem_cell(np, NULL, NULL);
+ 	if (IS_ERR(speedbin))
+ 		return PTR_ERR(speedbin);
+ 
+@@ -165,7 +180,7 @@ static void get_krait_bin_format_b(struct device *cpu_dev,
+ }
+ 
+ static int qcom_cpufreq_kryo_name_version(struct device *cpu_dev,
+-					  struct nvmem_cell *speedbin_nvmem,
++					  struct device_node *np,
+ 					  char **pvs_name,
+ 					  struct qcom_cpufreq_drv *drv)
+ {
+@@ -179,7 +194,7 @@ static int qcom_cpufreq_kryo_name_version(struct device *cpu_dev,
+ 	if (ret)
+ 		return ret;
+ 
+-	speedbin = nvmem_cell_read(speedbin_nvmem, &len);
++	speedbin = qcom_cpufreq_read_nvmem_cell(np, NULL, &len);
+ 	if (IS_ERR(speedbin))
+ 		return PTR_ERR(speedbin);
+ 
+@@ -213,7 +228,7 @@ static int qcom_cpufreq_kryo_name_version(struct device *cpu_dev,
+ }
+ 
+ static int qcom_cpufreq_krait_name_version(struct device *cpu_dev,
+-					   struct nvmem_cell *speedbin_nvmem,
++					   struct device_node *np,
+ 					   char **pvs_name,
+ 					   struct qcom_cpufreq_drv *drv)
+ {
+@@ -222,8 +237,7 @@ static int qcom_cpufreq_krait_name_version(struct device *cpu_dev,
+ 	size_t len;
+ 	int ret = 0;
+ 
+-	speedbin = nvmem_cell_read(speedbin_nvmem, &len);
+-
++	speedbin = qcom_cpufreq_read_nvmem_cell(np, NULL, &len);
+ 	if (IS_ERR(speedbin))
+ 		return PTR_ERR(speedbin);
+ 
+@@ -252,7 +266,7 @@ static int qcom_cpufreq_krait_name_version(struct device *cpu_dev,
+ }
+ 
+ static int qcom_cpufreq_ipq8064_name_version(struct device *cpu_dev,
+-					     struct nvmem_cell *speedbin_nvmem,
++					     struct device_node *np,
+ 					     char **pvs_name,
+ 					     struct qcom_cpufreq_drv *drv)
+ {
+@@ -261,7 +275,7 @@ static int qcom_cpufreq_ipq8064_name_version(struct device *cpu_dev,
+ 	u8 *speedbin;
+ 	size_t len;
+ 
+-	speedbin = nvmem_cell_read(speedbin_nvmem, &len);
++	speedbin = qcom_cpufreq_read_nvmem_cell(np, NULL, &len);
+ 	if (IS_ERR(speedbin))
+ 		return PTR_ERR(speedbin);
+ 
+@@ -307,7 +321,7 @@ static int qcom_cpufreq_ipq8064_name_version(struct device *cpu_dev,
+ }
+ 
+ static int qcom_cpufreq_ipq6018_name_version(struct device *cpu_dev,
+-					     struct nvmem_cell *speedbin_nvmem,
++					     struct device_node *np,
+ 					     char **pvs_name,
+ 					     struct qcom_cpufreq_drv *drv)
+ {
+@@ -320,7 +334,7 @@ static int qcom_cpufreq_ipq6018_name_version(struct device *cpu_dev,
+ 	if (ret)
+ 		return ret;
+ 
+-	speedbin = nvmem_cell_read(speedbin_nvmem, NULL);
++	speedbin = qcom_cpufreq_read_nvmem_cell(np, NULL, NULL);
+ 	if (IS_ERR(speedbin))
+ 		return PTR_ERR(speedbin);
+ 
+@@ -358,7 +372,7 @@ static int qcom_cpufreq_ipq6018_name_version(struct device *cpu_dev,
+ }
+ 
+ static int qcom_cpufreq_ipq8074_name_version(struct device *cpu_dev,
+-					     struct nvmem_cell *speedbin_nvmem,
++					     struct device_node *np,
+ 					     char **pvs_name,
+ 					     struct qcom_cpufreq_drv *drv)
+ {
+@@ -457,7 +471,6 @@ static void qcom_cpufreq_put_virt_devs(struct qcom_cpufreq_drv *drv, unsigned in
+ static int qcom_cpufreq_probe(struct platform_device *pdev)
+ {
+ 	struct qcom_cpufreq_drv *drv;
+-	struct nvmem_cell *speedbin_nvmem;
+ 	struct device *cpu_dev;
+ 	char pvs_name_buffer[] = "speedXX-pvsXX-vXX";
+ 	char *pvs_name = pvs_name_buffer;
+@@ -490,18 +503,9 @@ static int qcom_cpufreq_probe(struct platform_device *pdev)
+ 		return -ENODEV;
+ 
+ 	if (drv->data->get_version) {
+-		speedbin_nvmem = of_nvmem_cell_get(np, NULL);
+-		if (IS_ERR(speedbin_nvmem))
+-			return dev_err_probe(cpu_dev, PTR_ERR(speedbin_nvmem),
+-					     "Could not get nvmem cell\n");
+-
+-		ret = drv->data->get_version(cpu_dev,
+-							speedbin_nvmem, &pvs_name, drv);
+-		if (ret) {
+-			nvmem_cell_put(speedbin_nvmem);
++		ret = drv->data->get_version(cpu_dev, np, &pvs_name, drv);
++		if (ret)
+ 			return ret;
+-		}
+-		nvmem_cell_put(speedbin_nvmem);
+ 	}
+ 
+ 	for_each_possible_cpu(cpu) {
+-- 
+2.52.0
+
+
+From 2a7c9d6db1d3de5cf992a505ae09e7141ea1c14c Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Sat, 12 Aug 2023 15:29:51 +0200
+Subject: [PATCH 12/14] cpufreq: dt-platdev: Block qcom,msm8916 and
+ qcom,apq8016
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/cpufreq/cpufreq-dt-platdev.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/cpufreq/cpufreq-dt-platdev.c b/drivers/cpufreq/cpufreq-dt-platdev.c
+index 18942bfe9c95..68b11980c4c8 100644
+--- a/drivers/cpufreq/cpufreq-dt-platdev.c
++++ b/drivers/cpufreq/cpufreq-dt-platdev.c
+@@ -144,8 +144,10 @@ static const struct of_device_id blocklist[] __initconst = {
+ 	{ .compatible = "nvidia,tegra210", },
+ 	{ .compatible = "nvidia,tegra234", },
+ 
++	{ .compatible = "qcom,apq8016", },
+ 	{ .compatible = "qcom,apq8096", },
+ 	{ .compatible = "qcom,msm8909", },
++	{ .compatible = "qcom,msm8916", },
+ 	{ .compatible = "qcom,msm8996", },
+ 	{ .compatible = "qcom,msm8998", },
+ 	{ .compatible = "qcom,qcm2290", },
+-- 
+2.52.0
+
+
+From 7c75657bf7ec429fbdb89fffb23a25123b74122e Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Sat, 12 Aug 2023 15:30:36 +0200
+Subject: [PATCH 13/14] cpufreq: qcom-nvmem: Add MSM8916
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ drivers/cpufreq/qcom-cpufreq-nvmem.c | 34 ++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/drivers/cpufreq/qcom-cpufreq-nvmem.c b/drivers/cpufreq/qcom-cpufreq-nvmem.c
+index efc698ddce24..e6b938c1a73e 100644
+--- a/drivers/cpufreq/qcom-cpufreq-nvmem.c
++++ b/drivers/cpufreq/qcom-cpufreq-nvmem.c
+@@ -101,6 +101,31 @@ static int qcom_cpufreq_simple_get_version(struct device *cpu_dev,
+ 	return 0;
+ }
+ 
++static int qcom_cpufreq_msm8916_get_version(struct device *cpu_dev,
++					    struct device_node *np,
++					    char **pvs_name,
++					    struct qcom_cpufreq_drv *drv)
++{
++	u8 *pvs, *speedbin;
++
++	*pvs_name = NULL;
++	pvs = qcom_cpufreq_read_nvmem_cell(np, "pvs", NULL);
++	if (IS_ERR(pvs))
++		return PTR_ERR(pvs);
++
++	speedbin = qcom_cpufreq_read_nvmem_cell(np, *pvs ? "bin2" : "bin1", NULL);
++	if (IS_ERR(speedbin)) {
++		kfree(pvs);
++		return PTR_ERR(speedbin);
++	}
++
++	dev_dbg(cpu_dev, "speedbin: %d (pvs: %d)\n", *speedbin, *pvs);
++	drv->versions = 1 << *speedbin;
++	kfree(speedbin);
++	kfree(pvs);
++	return 0;
++}
++
+ static void get_krait_bin_format_a(struct device *cpu_dev,
+ 					  int *speed, int *pvs,
+ 					  u8 *buf)
+@@ -426,6 +451,13 @@ static const struct qcom_cpufreq_match_data match_data_msm8909 = {
+ 	.genpd_names = msm8909_genpd_names,
+ };
+ 
++static const char *msm8916_genpd_names[] = { "mx", "apc", "cx", NULL };
++
++static const struct qcom_cpufreq_match_data match_data_msm8916 = {
++	.get_version = qcom_cpufreq_msm8916_get_version,
++	.genpd_names = msm8916_genpd_names,
++};
++
+ static const char *qcs404_genpd_names[] = { "cpr", NULL };
+ 
+ static const struct qcom_cpufreq_match_data match_data_qcs404 = {
+@@ -621,6 +653,8 @@ static struct platform_driver qcom_cpufreq_driver = {
+ };
+ 
+ static const struct of_device_id qcom_cpufreq_match_list[] __initconst __maybe_unused = {
++	{ .compatible = "qcom,msm8916", .data = &match_data_msm8916 },
++	{ .compatible = "qcom,apq8016", .data = &match_data_msm8916 },
+ 	{ .compatible = "qcom,apq8096", .data = &match_data_kryo },
+ 	{ .compatible = "qcom,msm8909", .data = &match_data_msm8909 },
+ 	{ .compatible = "qcom,msm8996", .data = &match_data_kryo },
+-- 
+2.52.0
+
+
+From 3c90de7938043e688bdf7f085b75e7f11ba3242d Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan@gerhold.net>
+Date: Sat, 12 Aug 2023 15:31:22 +0200
+Subject: [PATCH 14/14] arm64: dts: qcom: msm8916: Add cpufreq scaling with
+ DVFS
+
+For cpufreq on MSM8916 we need to scale 3 different power domains:
+
+ 1. VDD_MX, managed by RPMPD
+ 2. VDD_APC, managed by CPR
+ 3. VDD_CX, for the higher CPU frequencies provided by the A53PLL
+
+Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
+---
+ arch/arm64/boot/dts/qcom/msm8916-pm8916.dtsi |  13 ++
+ arch/arm64/boot/dts/qcom/msm8916.dtsi        | 132 +++++++++++++++++--
+ arch/arm64/boot/dts/qcom/pm8916.dtsi         |   4 +
+ 3 files changed, 140 insertions(+), 9 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/msm8916-pm8916.dtsi b/arch/arm64/boot/dts/qcom/msm8916-pm8916.dtsi
+index b1a7eafbee31..d4c55d330839 100644
+--- a/arch/arm64/boot/dts/qcom/msm8916-pm8916.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8916-pm8916.dtsi
+@@ -15,6 +15,10 @@ &camss {
+ 	vdda-supply = <&pm8916_l2>;
+ };
+ 
++&cpr {
++	vdd-apc-supply = <&pm8916_spmi_s2>;
++};
++
+ &mdss_dsi0 {
+ 	vdda-supply = <&pm8916_l2>;
+ 	vddio-supply = <&pm8916_l6>;
+@@ -34,6 +38,15 @@ &pm8916_codec {
+ 	vdd-micbias-supply = <&pm8916_l13>;
+ };
+ 
++&pm8916_spmi_regulators {
++	pm8916_spmi_s2: s2 {
++		regulator-min-microvolt = <1050000>;
++		regulator-max-microvolt = <1350000>;
++		/* Disabled automatically by hardware when CPU is in deep idle */
++		regulator-always-on;
++	};
++};
++
+ &sdhc_1 {
+ 	vmmc-supply = <&pm8916_l8>;
+ 	vqmmc-supply = <&pm8916_l5>;
+diff --git a/arch/arm64/boot/dts/qcom/msm8916.dtsi b/arch/arm64/boot/dts/qcom/msm8916.dtsi
+index cb85f77cdc93..f5bd02a7bae1 100644
+--- a/arch/arm64/boot/dts/qcom/msm8916.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8916.dtsi
+@@ -151,8 +151,14 @@ CPU0: cpu@0 {
+ 			clocks = <&apcs>;
+ 			operating-points-v2 = <&cpu_opp_table>;
+ 			#cooling-cells = <2>;
+-			power-domains = <&CPU_PD0>;
+-			power-domain-names = "psci";
++			power-domains = <&CPU_PD0>,
++					<&cpr>,
++					<&rpmpd MSM8916_VDDMX_AO>,
++					<&rpmpd MSM8916_VDDCX_AO>;
++			power-domain-names = "psci",
++					     "apc",
++					     "mx",
++					     "cx";
+ 			qcom,acc = <&cpu0_acc>;
+ 			qcom,saw = <&cpu0_saw>;
+ 		};
+@@ -166,8 +172,14 @@ CPU1: cpu@1 {
+ 			clocks = <&apcs>;
+ 			operating-points-v2 = <&cpu_opp_table>;
+ 			#cooling-cells = <2>;
+-			power-domains = <&CPU_PD1>;
+-			power-domain-names = "psci";
++			power-domains = <&CPU_PD1>,
++					<&cpr>,
++					<&rpmpd MSM8916_VDDMX_AO>,
++					<&rpmpd MSM8916_VDDCX_AO>;
++			power-domain-names = "psci",
++					     "apc",
++					     "mx",
++					     "cx";
+ 			qcom,acc = <&cpu1_acc>;
+ 			qcom,saw = <&cpu1_saw>;
+ 		};
+@@ -181,8 +193,14 @@ CPU2: cpu@2 {
+ 			clocks = <&apcs>;
+ 			operating-points-v2 = <&cpu_opp_table>;
+ 			#cooling-cells = <2>;
+-			power-domains = <&CPU_PD2>;
+-			power-domain-names = "psci";
++			power-domains = <&CPU_PD2>,
++					<&cpr>,
++					<&rpmpd MSM8916_VDDMX_AO>,
++					<&rpmpd MSM8916_VDDCX_AO>;
++			power-domain-names = "psci",
++					     "apc",
++					     "mx",
++					     "cx";
+ 			qcom,acc = <&cpu2_acc>;
+ 			qcom,saw = <&cpu2_saw>;
+ 		};
+@@ -196,8 +214,14 @@ CPU3: cpu@3 {
+ 			clocks = <&apcs>;
+ 			operating-points-v2 = <&cpu_opp_table>;
+ 			#cooling-cells = <2>;
+-			power-domains = <&CPU_PD3>;
+-			power-domain-names = "psci";
++			power-domains = <&CPU_PD3>,
++					<&cpr>,
++					<&rpmpd MSM8916_VDDMX_AO>,
++					<&rpmpd MSM8916_VDDCX_AO>;
++			power-domain-names = "psci",
++					     "apc",
++					     "mx",
++					     "cx";
+ 			qcom,acc = <&cpu3_acc>;
+ 			qcom,saw = <&cpu3_saw>;
+ 		};
+@@ -243,20 +267,56 @@ CLUSTER_PWRDN: cluster-gdhs {
+ 	};
+ 
+ 	cpu_opp_table: opp-table-cpu {
+-		compatible = "operating-points-v2";
++		compatible = "operating-points-v2-kryo-cpu", "operating-points-v2";
++		nvmem-cells = <&pte_pvs_version>, <&pte_speedbin1>, <&pte_speedbin2>;
++		nvmem-cell-names = "pvs", "bin1", "bin2";
+ 		opp-shared;
+ 
++		/* CX votes are for the A53PLL (only used for >= 998.4 MHz) */
+ 		opp-200000000 {
+ 			opp-hz = /bits/ 64 <200000000>;
++			required-opps = <&rpmpd_opp_svs_soc>, <&cpr_opp1>, <&rpmpd_opp_none>;
++			opp-supported-hw = <0xf>; /* 0, 1, 2, 3 */
+ 		};
+ 		opp-400000000 {
+ 			opp-hz = /bits/ 64 <400000000>;
++			required-opps = <&rpmpd_opp_svs_soc>, <&cpr_opp1>, <&rpmpd_opp_none>;
++			opp-supported-hw = <0xf>; /* 0, 1, 2, 3 */
++		};
++		opp-533333000 {
++			opp-hz = /bits/ 64 <533333000>;
++			required-opps = <&rpmpd_opp_nom>, <&cpr_opp2>, <&rpmpd_opp_none>;
++			opp-supported-hw = <0xf>; /* 0, 1, 2, 3 */
+ 		};
+ 		opp-800000000 {
+ 			opp-hz = /bits/ 64 <800000000>;
++			required-opps = <&rpmpd_opp_nom>, <&cpr_opp2>, <&rpmpd_opp_none>;
++			opp-supported-hw = <0xf>; /* 0, 1, 2, 3 */
+ 		};
+ 		opp-998400000 {
+ 			opp-hz = /bits/ 64 <998400000>;
++			required-opps = <&rpmpd_opp_super_turbo>, <&cpr_opp3>, <&rpmpd_opp_svs_soc>;
++			opp-supported-hw = <0xf>; /* 0, 1, 2, 3 */
++		};
++		opp-1094400000 {
++			opp-hz = /bits/ 64 <1094400000>;
++			required-opps = <&rpmpd_opp_super_turbo>, <&cpr_opp3>, <&rpmpd_opp_nom>;
++			opp-supported-hw = <0x7>; /* 0, 1, 2 */
++		};
++		opp-1152000000 {
++			opp-hz = /bits/ 64 <1152000000>;
++			required-opps = <&rpmpd_opp_super_turbo>, <&cpr_opp3>, <&rpmpd_opp_nom>;
++			opp-supported-hw = <0x7>; /* 0, 1, 2 */
++		};
++		opp-1209600000 {
++			opp-hz = /bits/ 64 <1209600000>;
++			required-opps = <&rpmpd_opp_super_turbo>, <&cpr_opp3>, <&rpmpd_opp_nom>;
++			opp-supported-hw = <0x5>; /* 0, 2 */
++		};
++		opp-1363200000 {
++			opp-hz = /bits/ 64 <1363200000>;
++			required-opps = <&rpmpd_opp_super_turbo>, <&cpr_opp3>, <&rpmpd_opp_nom>;
++			opp-supported-hw = <0x4>; /* 2 */
+ 		};
+ 	};
+ 
+@@ -362,6 +422,9 @@ rpmpd: power-controller {
+ 					rpmpd_opp_table: opp-table {
+ 						compatible = "operating-points-v2";
+ 
++						rpmpd_opp_none: opp0 {
++							opp-level = <0>;
++						};
+ 						rpmpd_opp_ret: opp1 {
+ 							opp-level = <1>;
+ 						};
+@@ -491,6 +554,26 @@ qfprom: qfprom@5c000 {
+ 			#address-cells = <1>;
+ 			#size-cells = <1>;
+ 
++			pte_pvs_version: pvs-version@6 {
++				reg = <0x06 0x1>;
++				bits = <2 2>;
++			};
++
++			mem_acc_override: mem-acc-override@6 {
++				reg = <0x06 0x1>;
++				bits = <4 1>;
++			};
++
++			pte_speedbin1: speedbin1@6 {
++				reg = <0x06 0x2>;
++				bits = <7 2>;
++			};
++
++			pte_speedbin2: speedbin2@c {
++				reg = <0x0c 0x1>;
++				bits = <2 3>;
++			};
++
+ 			tsens_base1: base1@d0 {
+ 				reg = <0xd0 0x1>;
+ 				bits = <0 7>;
+@@ -2566,6 +2649,37 @@ a53pll: clock@b016000 {
+ 			clock-names = "xo";
+ 		};
+ 
++		cpr: power-controller@b018000 {
++			compatible = "qcom,msm8916-cpr", "qcom,cpr";
++			reg = <0x0b018000 0x1000>;
++			interrupts = <GIC_SPI 15 IRQ_TYPE_EDGE_RISING>;
++			clocks = <&xo_board>;
++			clock-names = "ref";
++			#power-domain-cells = <0>;
++			operating-points-v2 = <&cpr_opp_table>;
++			acc-syscon = <&tcsr>;
++			nvmem-cells = <&mem_acc_override>;
++			nvmem-cell-names = "mem_acc_override";
++			qcom,force-ceiling-voltage;
++
++			cpr_opp_table: opp-table {
++				compatible = "operating-points-v2-qcom-level";
++
++				cpr_opp1: opp1 {
++					opp-level = <1>;
++					qcom,opp-fuse-level = <1>;
++				};
++				cpr_opp2: opp2 {
++					opp-level = <2>;
++					qcom,opp-fuse-level = <2>;
++				};
++				cpr_opp3: opp3 {
++					opp-level = <3>;
++					qcom,opp-fuse-level = <3>;
++				};
++			};
++		};
++
+ 		timer@b020000 {
+ 			#address-cells = <1>;
+ 			#size-cells = <1>;
+diff --git a/arch/arm64/boot/dts/qcom/pm8916.dtsi b/arch/arm64/boot/dts/qcom/pm8916.dtsi
+index f8e4829ff7f7..ebf8b477185a 100644
+--- a/arch/arm64/boot/dts/qcom/pm8916.dtsi
++++ b/arch/arm64/boot/dts/qcom/pm8916.dtsi
+@@ -210,6 +210,10 @@ pm8916_pwm: pwm {
+ 			status = "disabled";
+ 		};
+ 
++		pm8916_spmi_regulators: regulators {
++			compatible = "qcom,pm8916-regulators";
++		};
++
+ 		pm8916_vib: vibrator@c000 {
+ 			compatible = "qcom,pm8916-vib";
+ 			reg = <0xc000>;
+-- 
+2.52.0
+

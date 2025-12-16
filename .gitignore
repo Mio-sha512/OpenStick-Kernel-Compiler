@@ -1,0 +1,9 @@
+builds/*
+!builds/.gitkeep
+linux-msm8916/
+pmos-venv/
+pmos-work/
+pmbootstrap/
+.build_config
+downloaded_defconfig_temp
+pmos.config
