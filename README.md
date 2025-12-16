@@ -28,9 +28,9 @@ cd OpenStick-Kernel-Compiler
 
 The script supports interactive and non-interactive modes and a small set of flags. Use these from the command line or via the interactive menu.
 
-- `--auto` — run non-interactively and use values from `./.build_config` (see below). When `--auto` is used:
-  - If `./.build_config` exists, it will be sourced and those settings will be used without prompting.
-  - If there is no `./.build_config` and you did not pass any explicit flags (for example `--version` or `--cpr`), the script will exit and ask you to either create a saved config (by running once interactively and using `--save`) or supply explicit flags.
+- `--auto` — run non-interactively and use values from `.build_config` (see below). When `--auto` is used:
+  - If `.build_config` exists, it will be sourced and those settings will be used without prompting.
+  - If there is no `.build_config` and you did not pass any explicit flags (for example `--version` or `--cpr`), the script will exit and ask you to either create a saved config (by running once interactively and using `--save`) or supply explicit flags.
 
 - `--version <branch>` — select the kernel branch to build (e.g. `msm8916/6.12.1`). This overrides the saved `KERNEL_VERSION` when used alongside `--auto`.
 
@@ -38,7 +38,7 @@ The script supports interactive and non-interactive modes and a small set of fla
 
 - `--clean` — force a clean build (removes output cache).
 
-- `--save` — after you finish the interactive prompts, write the selected settings to `./.build_config` so they are reused by `--auto` in future runs.
+- `--save` — after you finish the interactive prompts, write the selected settings to `.build_config` so they are reused by `--auto` in future runs.
 
 Example: non-interactive CPR build using a known-good branch
 
@@ -46,12 +46,12 @@ Example: non-interactive CPR build using a known-good branch
 ./build.sh --auto --version msm8916/6.12.1 --cpr
 ```
 
-> Note on user patches: extra patches placed in `patches/` can be selected from the interactive patch selector. These are not persisted to `./.build_config` by the current script.
+> Note on user patches: extra patches placed in `patches/` can be selected from the interactive patch selector. These are not persisted to `.build_config` by the current script.
 
 
 ## .build_config
 
-When you run the builder with `--save`, the script writes a minimal configuration file `./.build_config` that contains shell assignments for the most common options. Example contents:
+When you run the builder with `--save`, the script writes a minimal configuration file `.build_config` that contains shell assignments for the most common options. Example contents:
 
 ```bash
 KERNEL_VERSION="msm8916/6.12.1"
@@ -78,6 +78,6 @@ For device-specific information about see the [postmarketOS wiki](https://wiki.p
 
 ## Using in OpenStick-Builder
 
-easy intergration comming soon, pinky finger promise
+easy intergration coming soon, pinky finger promise
 
 

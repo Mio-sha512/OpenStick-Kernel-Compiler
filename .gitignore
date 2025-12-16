@@ -1,5 +1,4 @@
-builds/*
-!builds/.gitkeep
+builds/
 linux-msm8916/
 pmos-venv/
 pmos-work/
