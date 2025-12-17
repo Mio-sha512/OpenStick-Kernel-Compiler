@@ -304,6 +304,11 @@ else
     source "$VENV_DIR/bin/activate"
 fi
 
+# Fix for python older than 3.11
+if ! python3 -c "import sys; exit(0) if sys.version_info >= (3, 11) else exit(1)"; then
+    pip install tomli
+fi
+
 if [ ! -d "$PMBOOTSTRAP_DIR" ]; then
     git clone "https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git" "$PMBOOTSTRAP_DIR"
 fi
@@ -318,6 +323,10 @@ fi
 
 log_info "Initializing pmbootstrap..."
 yes "" | pmbootstrap -w "$PMOS_WORKDIR" -p "$PMAPORTS_PATH" init --shallow-initial-clone >/dev/null 2>&1 || true
+
+# Configure pmbootstrap with the correct device as else it defaults to x86_64
+pmbootstrap -w "$PMOS_WORKDIR" config device qcom-msm8916
+pmbootstrap -w "$PMOS_WORKDIR" config ui console
 
 if [ -d "$PMOS_WORKDIR/packages" ]; then sudo rm -rf "$PMOS_WORKDIR/packages"; fi
 
@@ -334,7 +343,7 @@ else
 fi
 cd "$KERNEL_SRC_DIR"
 curl -sSL "$DEFCONFIG_URL" -o "$SCRIPT_DIR/downloaded_defconfig_temp"
-curl -sSL "$PMOS_CONFIG_URL" -o "$SCRIPT_DIR/pmos.config"
+#curl -sSL "$PMOS_CONFIG_URL" -o "$SCRIPT_DIR/pmos.config" # seems to break things but worked in initial testing will compile without it
 
 # Activate environment
 cd "$KERNEL_SRC_DIR"
@@ -427,7 +436,7 @@ else
     if [ -f "$SCRIPT_DIR/pmos.config" ]; then
         log_info "Merging pmos.config..."
         sudo chmod 666 "$TARGET_CONFIG" 2>/dev/null || true
-        ./scripts/kconfig/merge_config.sh -m "$TARGET_CONFIG" "$SCRIPT_DIR/pmos.config"
+        ./scripts/kconfig/merge_config.sh -n -m "$TARGET_CONFIG" "$SCRIPT_DIR/pmos.config"
         make olddefconfig
     fi
 
