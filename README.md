@@ -12,7 +12,8 @@ If you prefer not to compile yourself check the [releases page](https://github.c
 
 
 ## Requirements
-- Any distro  with `bash`, `git`, `curl`, and `python3` available.
+- Any distro  with `bash`, `git`, `curl`, and `python3` with `venv` available.
+- Tested on Fedora 42/43 and Ubuntu 22.04.
 
 ## Instructions
 
